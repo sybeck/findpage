@@ -304,6 +304,44 @@ def main():
 
     print("\n총 발견 제품 수:", len(found_products))
 
+def scan_for_slack(product_url: str):
+    """
+    Slack bot용 엔트리 함수
+    - Slack에서는 product_url 하나만 넘기면 됨
+    - 내부 로직은 CLI와 동일
+    """
+    platform, template_url = detect_platform_from_product_url(product_url)
+    if not platform:
+        raise ValueError("Unsupported product URL pattern")
+
+    input_product_id = extract_product_id_from_input_url(product_url)
+    if input_product_id is None:
+        raise ValueError("Failed to extract product id from URL")
+
+    # 1차 스캔
+    found_products, found_urls = scan_pass(
+        template_url=template_url,
+        start_id=1,
+        stop_after_consecutive_misses=STOP_AFTER_CONSECUTIVE_MISSES,
+        sleep_sec=SLEEP_SEC,
+        allow_extra_retry_if_zero_found=True,
+        found_products=[],
+        found_urls=set(),
+    )
+
+    # 조건부 2차 스캔
+    if len(found_products) < (input_product_id * 0.01):
+        found_products, found_urls = scan_pass(
+            template_url=template_url,
+            start_id=input_product_id,
+            stop_after_consecutive_misses=STOP_AFTER_CONSECUTIVE_MISSES,
+            sleep_sec=SLEEP_SEC,
+            allow_extra_retry_if_zero_found=False,
+            found_products=found_products,
+            found_urls=found_urls,
+        )
+
+    return found_products
 
 if __name__ == "__main__":
     main()
