@@ -17,7 +17,10 @@ SLEEP_SEC = 1.0
 STOP_AFTER_CONSECUTIVE_MISSES = 100
 TIMEOUT_SEC = 10
 
-USER_AGENT = "Mozilla/5.0 (compatible; ProductPageScanner/2.1)"
+# ✅ 비정상 상황 감지: 연속으로 "FOUND"가 너무 오래 지속되는 경우
+STOP_AFTER_CONSECUTIVE_HITS = 200
+
+USER_AGENT = "Mozilla/5.0 (compatible; ProductPageScanner/2.2)"
 
 # ----------------------------
 # URL utils
@@ -36,15 +39,49 @@ def normalize_home(url: str) -> str:
 def strip_query_fragment(url: str) -> str:
     """
     Remove ?query and #fragment for stable path detection.
-    (NOTE: For id extraction, we still use original query from raw URL.)
     """
     u = ensure_scheme(url)
     p = urlparse(u)
     return urlunparse((p.scheme, p.netloc, p.path, "", "", ""))
 
 def is_homepage(url: str) -> bool:
-    p = urlparse(url)
-    return (p.path or "").rstrip("/") in ["", "/"]
+    """
+    ✅ '없는 상품 → 홈/인덱스로 리다이렉트'를 잡기 위해 홈 판별을 넓게.
+    """
+    p = urlparse(ensure_scheme(url))
+    path = (p.path or "").lower().strip()
+
+    # "/" 또는 "" (기본 홈)
+    if path in ["", "/"]:
+        return True
+
+    # 흔한 홈/인덱스 경로
+    home_like_paths = {
+        "/index.html",
+        "/index.htm",
+        "/index.php",
+        "/index.asp",
+        "/index.aspx",
+        "/default.asp",
+        "/default.aspx",
+        "/main",
+        "/main/",
+        "/main/index.html",
+        "/main/index.htm",
+        "/main/index.php",
+    }
+    if path in home_like_paths:
+        return True
+
+    return False
+
+def normalize_for_compare(url: str) -> str:
+    """
+    URL 비교용 정규화 (쿼리/프래그먼트 제거 + 호스트/스킴 소문자 + trailing slash 제거)
+    """
+    p = urlparse(ensure_scheme(url))
+    path = (p.path or "").rstrip("/")
+    return f"{p.scheme.lower()}://{p.netloc.lower()}{path}"
 
 # ----------------------------
 # Product ID extraction
@@ -66,17 +103,17 @@ def extract_product_id_from_input_url(product_url: str) -> int | None:
     path = p_clean.path or ""
     query = p_raw.query or ""
 
-    # Cafe24 A: /surl/p/{id}
+    # Cafe24 A
     m = re.search(r"/surl/p/(\d+)", path)
     if m:
         return int(m.group(1))
 
-    # Cafe24 B: /product/.../{id}/category/...
+    # Cafe24 B (id right before /category/)
     m = re.search(r"/product/.+/(\d+)/category/", path)
     if m:
         return int(m.group(1))
 
-    # Cafe24 C: /product/detail.html?product_no={id}
+    # Cafe24 C: /product/detail.html?product_no=819
     if path.rstrip("/").lower().endswith("/product/detail.html"):
         qs = parse_qs(query)
         if "product_no" in qs and qs["product_no"]:
@@ -84,7 +121,7 @@ def extract_product_id_from_input_url(product_url: str) -> int | None:
             if v.isdigit():
                 return int(v)
 
-    # Imweb: /Product/?idx={id}
+    # Imweb idx
     if path.rstrip("/").lower().endswith("/product"):
         qs = parse_qs(query)
         if "idx" in qs and qs["idx"]:
@@ -104,8 +141,7 @@ def detect_platform_from_product_url(product_url: str):
         * /surl/p/{id}
         * /product/.../{id}/category/...
         * /product/detail.html?product_no={id}
-      ✅ Policy: If detected as Cafe24, scanning MUST ALWAYS use:
-        /surl/p/{id}
+      ✅ Policy: If detected as Cafe24, scanning MUST ALWAYS use /surl/p/{id}
 
     - Imweb:
         * /Product/?idx={id}
@@ -161,14 +197,16 @@ def extract_product_name(html: str) -> str:
     return "(제품명 추출 실패)"
 
 # ----------------------------
-# Not-found 판단
+# Not-found 판단 (✅ 원래 아이디어대로: 홈/인덱스 리다이렉트는 NOT FOUND)
 # ----------------------------
 def looks_not_found(status_code: int, requested_url: str, final_url: str, html: str) -> bool:
     if status_code != 200:
         return True
 
-    # 없는 상품이면 홈으로 리다이렉트되는 케이스
-    if requested_url.rstrip("/") != final_url.rstrip("/") and is_homepage(final_url):
+    # ✅ 없는 상품이면 홈/인덱스 계열로 리다이렉트되는 케이스
+    req = normalize_for_compare(requested_url)
+    fin = normalize_for_compare(final_url)
+    if req != fin and is_homepage(final_url):
         return True
 
     sample = (html[:20000] or "").lower()
@@ -199,12 +237,17 @@ def scan_pass(
     - stops when consecutive misses reach stop_after_consecutive_misses
     - optional extra retry ONLY when allow_extra_retry_if_zero_found=True
       and found_products is still empty at first stop trigger.
+
+    ✅ 추가 보호:
+    - 연속 STOP_AFTER_CONSECUTIVE_HITS(기본 200)번 FOUND가 나오면 비정상으로 보고 에러 발생
+      (예: 모든 요청이 어떤 공통 페이지로 "FOUND"로 판정되는 경우)
     """
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
 
     product_id = start_id
     consecutive_misses = 0
+    consecutive_hits = 0
     extra_retry_used = False
 
     if found_products is None:
@@ -221,20 +264,31 @@ def scan_pass(
 
             if looks_not_found(r.status_code, url, r.url, r.text or ""):
                 consecutive_misses += 1
+                consecutive_hits = 0
                 print(f"  -> NOT FOUND ({consecutive_misses}/{stop_after_consecutive_misses})")
             else:
                 consecutive_misses = 0
-                final_url = r.url
+                consecutive_hits += 1
 
+                final_url = r.url
                 if final_url not in found_urls:
                     name = extract_product_name(r.text or "")
                     found_products.append((name, final_url))
                     found_urls.add(final_url)
 
-                print(f"  ✅ FOUND: {final_url}")
+                print(f"  ✅ FOUND: {final_url} ({consecutive_hits}/{STOP_AFTER_CONSECUTIVE_HITS})")
+
+                # ✅ 비정상 감지: 연속으로 너무 많이 FOUND
+                if consecutive_hits >= STOP_AFTER_CONSECUTIVE_HITS:
+                    raise RuntimeError(
+                        f"비정상 감지: 연속 {STOP_AFTER_CONSECUTIVE_HITS}개가 'FOUND'로 판정되었습니다. "
+                        f"NOT FOUND 판정이 잘못되었거나 모든 요청이 공통 페이지로 리다이렉트되는 상황일 수 있습니다. "
+                        f"(예: 마지막 요청 URL: {url}, 최종 URL: {final_url})"
+                    )
 
         except requests.RequestException as e:
             consecutive_misses += 1
+            consecutive_hits = 0
             print(f"  -> ERROR: {e} ({consecutive_misses}/{stop_after_consecutive_misses})")
 
         if consecutive_misses >= stop_after_consecutive_misses:
@@ -256,8 +310,8 @@ def scan_pass(
 def main():
     print("제품 페이지 URL을 입력하세요 (UTM 포함 가능)")
     print("예) https://brainology.kr/surl/p/10")
-    print("예) https://brainology.kr/product/.../10/category/24/display/1/  (감지 전용, 스캔은 /surl/p/{id})")
-    print("예) https://drphytomall.com/product/detail.html?product_no=819  (감지 전용, 스캔은 /surl/p/{id})")
+    print("예) https://brainology.kr/product/.../10/category/24/display/1/  (카페24 감지용, 스캔은 /surl/p/{id})")
+    print("예) https://drphytomall.com/product/detail.html?product_no=819  (카페24 감지용, 스캔은 /surl/p/{id})")
     print("예) https://www.realcumin.kr/Product/?idx=72")
     product_url = input("> ").strip()
 
@@ -277,6 +331,7 @@ def main():
     print(f"[INFO] 실제 스캔 URL 패턴: {template_url}")
     print(f"[INFO] 입력 URL 제품 id: {input_product_id}")
     print(f"[INFO] 중단 기준: 연속 {STOP_AFTER_CONSECUTIVE_MISSES}회 NOT FOUND/ERROR")
+    print(f"[INFO] 비정상 기준: 연속 {STOP_AFTER_CONSECUTIVE_HITS}회 FOUND면 에러")
     print(f"[INFO] 스캔 속도: {SLEEP_SEC}초에 1회")
     print("\n[START] 1차 스캔 (start=1)\n")
 
@@ -292,7 +347,7 @@ def main():
     )
 
     # 2) Conditional second pass
-    threshold = input_product_id * 0.01  # as requested
+    threshold = input_product_id * 0.01
     if len(found_products) < threshold:
         print("\n" + "-" * 60)
         print("[INFO] 추가 조건 트리거!")
@@ -305,7 +360,7 @@ def main():
             start_id=input_product_id,
             stop_after_consecutive_misses=STOP_AFTER_CONSECUTIVE_MISSES,
             sleep_sec=SLEEP_SEC,
-            allow_extra_retry_if_zero_found=False,  # 요구사항대로: 연속 100번 안 나올 때까지
+            allow_extra_retry_if_zero_found=False,
             found_products=found_products,
             found_urls=found_urls,
         )
@@ -330,8 +385,6 @@ def main():
 def scan_for_slack(product_url: str):
     """
     Slack bot용 엔트리 함수
-    - Slack에서는 product_url 하나만 넘기면 됨
-    - 내부 로직은 CLI와 동일
     """
     platform, template_url = detect_platform_from_product_url(product_url)
     if not platform:
@@ -341,7 +394,6 @@ def scan_for_slack(product_url: str):
     if input_product_id is None:
         raise ValueError("Failed to extract product id from URL")
 
-    # 1차 스캔
     found_products, found_urls = scan_pass(
         template_url=template_url,
         start_id=1,
@@ -352,7 +404,6 @@ def scan_for_slack(product_url: str):
         found_urls=set(),
     )
 
-    # 조건부 2차 스캔
     if len(found_products) < (input_product_id * 0.01):
         found_products, found_urls = scan_pass(
             template_url=template_url,
