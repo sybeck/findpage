@@ -2,23 +2,19 @@
 import os
 import re
 import threading
-from dotenv import load_dotenv
 
+from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-# --- 여기서는 find_page.py의 핵심 함수들만 import해서 재사용하는 걸 권장 ---
-# 만약 find_page.py가 아직 CLI 중심이라면, 아래 TODO대로 함수만 꺼내면 됩니다.
-from find_page import (
-    detect_platform_from_product_url,
-    scan,  # scan(template_url) -> list[(name, url)]
-)
+# ✅ find_page.py에 추가한 wrapper 함수 사용
+from find_page import scan_for_slack
 
 load_dotenv()
 
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 SLACK_APP_TOKEN = os.getenv("SLACK_APP_TOKEN")
-TARGET_CHANNEL_ID = os.getenv("SLACK_CHANNEL_ID")  # 특정 채널만 감지
+TARGET_CHANNEL_ID = os.getenv("SLACK_CHANNEL_ID")  # 특정 채널만 감지(비워두면 모든 채널)
 
 if not SLACK_BOT_TOKEN or not SLACK_APP_TOKEN:
     raise RuntimeError("SLACK_BOT_TOKEN / SLACK_APP_TOKEN 을 .env에 설정하세요.")
@@ -27,71 +23,78 @@ app = App(token=SLACK_BOT_TOKEN)
 
 URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 
+
 def extract_first_url(text: str) -> str | None:
     if not text:
         return None
     m = URL_RE.search(text)
     return m.group(0) if m else None
 
+
 def format_results(results: list[tuple[str, str]]) -> str:
+    """
+    Slack 메시지로 요약 출력 (제품명 + URL)
+    """
     if not results:
         return "찾은 제품 페이지가 없습니다."
+
     lines = []
     for i, (name, url) in enumerate(results, 1):
         lines.append(f"{i}. {name}\n{url}")
     return "\n\n".join(lines)
 
+
 def run_scan_and_reply(client, channel: str, thread_ts: str, product_url: str):
-    # 1) 플랫폼/템플릿 감지
-    platform, template_url = detect_platform_from_product_url(product_url)
-    if not platform:
+    """
+    백그라운드 스레드에서 스캔 실행 → 스레드에 결과 업로드
+    """
+    try:
         client.chat_postMessage(
             channel=channel,
             thread_ts=thread_ts,
-            text=f"❌ 처음 보는 페이지 패턴입니다.\n입력한 주소: {product_url}\n\n지원:\n- 카페24: https://도메인/surl/p/숫자\n- 카페24(감지): https://도메인/product/.../숫자/category/...\n- 아임웹: https://도메인/Product/?idx=숫자",
+            text=f"🔎 스캔 시작\n입력 URL: {product_url}\n(1초에 1회 요청 / 연속 100번 실패 시 중단, 조건부 추가 스캔 포함)",
         )
-        return
 
-    # 2) 시작 안내
-    client.chat_postMessage(
-        channel=channel,
-        thread_ts=thread_ts,
-        text=f"🔎 스캔 시작\n- 감지 플랫폼: {platform}\n- 스캔 패턴: {template_url}\n- 속도: 1초 1회\n- 중단: 연속 30번 실패 (단, 처음 30번 내 0건이면 추가 30번 더 시도)",
-    )
+        results = scan_for_slack(product_url)
 
-    # 3) 스캔 실행 (여기서 scan()은 기존 로직 그대로 사용)
-    results = scan(template_url)
+        client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text="✅ 스캔 결과\n\n" + format_results(results),
+        )
 
-    # 4) 요약 업로드
-    client.chat_postMessage(
-        channel=channel,
-        thread_ts=thread_ts,
-        text="✅ 스캔 결과\n\n" + format_results(results),
-    )
+    except Exception as e:
+        client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=f"❌ 스캔 중 오류 발생\n{type(e).__name__}: {e}",
+        )
+
 
 @app.event("message")
 def handle_message_events(body, event, client, logger):
-    # 메시지 이벤트 중 봇 메시지/수정 이벤트 등은 제외
+    # 봇 메시지/수정/알림 등 subtype 이벤트는 무시
     if event.get("subtype"):
         return
 
     channel = event.get("channel")
+
+    # 특정 채널만 감지하도록 제한
     if TARGET_CHANNEL_ID and channel != TARGET_CHANNEL_ID:
         return
 
     text = event.get("text", "")
-    user = event.get("user")
-    ts = event.get("ts")
+    ts = event.get("ts")  # 원문 메시지 ts를 thread_ts로 사용
 
     url = extract_first_url(text)
     if not url:
         return
 
-    # 즉시 응답(ACK) 후 백그라운드 스레드에서 스캔 (슬랙 이벤트 처리 타임아웃 방지)
+    # 즉시 스레드에 "감지" 메시지 남기고, 스캔은 별도 스레드에서 실행
     client.chat_postMessage(
         channel=channel,
         thread_ts=ts,
-        text=f"URL 감지: {url}\n스캔을 시작합니다…",
+        text=f"URL 감지 ✅\n{url}\n스캔을 시작합니다.",
     )
 
     t = threading.Thread(
@@ -100,6 +103,7 @@ def handle_message_events(body, event, client, logger):
         daemon=True,
     )
     t.start()
+
 
 if __name__ == "__main__":
     SocketModeHandler(app, SLACK_APP_TOKEN).start()
