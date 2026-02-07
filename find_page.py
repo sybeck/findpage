@@ -17,7 +17,7 @@ SLEEP_SEC = 1.0
 STOP_AFTER_CONSECUTIVE_MISSES = 100
 TIMEOUT_SEC = 10
 
-USER_AGENT = "Mozilla/5.0 (compatible; ProductPageScanner/1.9)"
+USER_AGENT = "Mozilla/5.0 (compatible; ProductPageScanner/2.1)"
 
 # ----------------------------
 # URL utils
@@ -34,6 +34,10 @@ def normalize_home(url: str) -> str:
     return urlunparse((p.scheme, p.netloc, "", "", "", ""))
 
 def strip_query_fragment(url: str) -> str:
+    """
+    Remove ?query and #fragment for stable path detection.
+    (NOTE: For id extraction, we still use original query from raw URL.)
+    """
     u = ensure_scheme(url)
     p = urlparse(u)
     return urlunparse((p.scheme, p.netloc, p.path, "", "", ""))
@@ -49,9 +53,9 @@ def extract_product_id_from_input_url(product_url: str) -> int | None:
     """
     Extract product id from supported input URL patterns.
     - Cafe24 A: /surl/p/{id}
-    - Cafe24 B: /product/.../{id}/category/...
-      (id is the number right before '/category/')
-    - Imweb: /Product/?idx={id}
+    - Cafe24 B: /product/.../{id}/category/...  (id is right before '/category/')
+    - Cafe24 C: /product/detail.html?product_no={id}
+    - Imweb:    /Product/?idx={id}
     """
     raw = ensure_scheme(product_url)
     clean = strip_query_fragment(raw)
@@ -62,38 +66,49 @@ def extract_product_id_from_input_url(product_url: str) -> int | None:
     path = p_clean.path or ""
     query = p_raw.query or ""
 
-    # Cafe24 A
+    # Cafe24 A: /surl/p/{id}
     m = re.search(r"/surl/p/(\d+)", path)
     if m:
         return int(m.group(1))
 
-    # Cafe24 B (id right before /category/)
+    # Cafe24 B: /product/.../{id}/category/...
     m = re.search(r"/product/.+/(\d+)/category/", path)
     if m:
         return int(m.group(1))
 
-    # Imweb idx
+    # Cafe24 C: /product/detail.html?product_no={id}
+    if path.rstrip("/").lower().endswith("/product/detail.html"):
+        qs = parse_qs(query)
+        if "product_no" in qs and qs["product_no"]:
+            v = qs["product_no"][0]
+            if v.isdigit():
+                return int(v)
+
+    # Imweb: /Product/?idx={id}
     if path.rstrip("/").lower().endswith("/product"):
         qs = parse_qs(query)
         if "idx" in qs and qs["idx"]:
             v = qs["idx"][0]
-            if re.match(r"^\d+$", v):
+            if v.isdigit():
                 return int(v)
 
     return None
 
 # ----------------------------
-# Platform detection (감지용 패턴 확장) + 스캔 템플릿 확정
+# Platform detection (+ scan template policy)
 # ----------------------------
 def detect_platform_from_product_url(product_url: str):
     """
-    감지용 패턴:
+    Supported patterns:
     - Cafe24:
-        1) /surl/p/{id}
-        2) /product/.../{id}/category/... (감지 전용)
-       → 감지 후 스캔은 항상 /surl/p/{id}
+        * /surl/p/{id}
+        * /product/.../{id}/category/...
+        * /product/detail.html?product_no={id}
+      ✅ Policy: If detected as Cafe24, scanning MUST ALWAYS use:
+        /surl/p/{id}
+
     - Imweb:
-        /Product/?idx={id}
+        * /Product/?idx={id}
     """
     raw = ensure_scheme(product_url)
     clean = strip_query_fragment(raw)
@@ -105,15 +120,22 @@ def detect_platform_from_product_url(product_url: str):
     query = parsed_raw.query or ""
     base = normalize_home(clean)
 
-    # ---- Cafe24 (A): /surl/p/{id}
+    # -----------------
+    # Cafe24 (ALL CASES) -> always scan with /surl/p/{id}
+    # -----------------
     if "/surl/p/" in path and re.search(r"/surl/p/\d+", path):
         return "cafe24", f"{base}/surl/p/{{id}}"
 
-    # ---- Cafe24 (B): /product/.../{id}/category/...  (감지 전용)
     if path.startswith("/product/") and re.search(r"/product/.+/\d+/category/", path):
         return "cafe24", f"{base}/surl/p/{{id}}"
 
-    # ---- Imweb: /Product/?idx={id}
+    if path.rstrip("/").lower().endswith("/product/detail.html"):
+        if re.search(r"(?:^|&)product_no=\d+(?:&|$)", query, re.IGNORECASE):
+            return "cafe24", f"{base}/surl/p/{{id}}"
+
+    # -----------------
+    # Imweb
+    # -----------------
     if path.rstrip("/").lower().endswith("/product"):
         if re.search(r"(?:^|&)idx=\d+(?:&|$)", query, re.IGNORECASE):
             return "imweb", f"{base}/Product/?idx={{id}}"
@@ -235,6 +257,7 @@ def main():
     print("제품 페이지 URL을 입력하세요 (UTM 포함 가능)")
     print("예) https://brainology.kr/surl/p/10")
     print("예) https://brainology.kr/product/.../10/category/24/display/1/  (감지 전용, 스캔은 /surl/p/{id})")
+    print("예) https://drphytomall.com/product/detail.html?product_no=819  (감지 전용, 스캔은 /surl/p/{id})")
     print("예) https://www.realcumin.kr/Product/?idx=72")
     product_url = input("> ").strip()
 
