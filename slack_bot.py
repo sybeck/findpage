@@ -7,14 +7,13 @@ from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-# ✅ find_page.py에 추가한 wrapper 함수 사용
-from find_page import scan_for_slack
+from find_page import scan_for_slack, detect_platform_from_product_url
 
 load_dotenv()
 
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 SLACK_APP_TOKEN = os.getenv("SLACK_APP_TOKEN")
-TARGET_CHANNEL_ID = os.getenv("SLACK_CHANNEL_ID")  # 특정 채널만 감지(비워두면 모든 채널)
+TARGET_CHANNEL_ID = os.getenv("SLACK_CHANNEL_ID")  # 비워두면 모든 채널
 
 if not SLACK_BOT_TOKEN or not SLACK_APP_TOKEN:
     raise RuntimeError("SLACK_BOT_TOKEN / SLACK_APP_TOKEN 을 .env에 설정하세요.")
@@ -32,70 +31,81 @@ def extract_first_url(text: str) -> str | None:
 
 
 def format_results(results: list[tuple[str, str]]) -> str:
-    """
-    Slack 메시지로 요약 출력 (제품명 + URL)
-    """
     if not results:
         return "찾은 제품 페이지가 없습니다."
-
     lines = []
     for i, (name, url) in enumerate(results, 1):
         lines.append(f"{i}. {name}\n{url}")
     return "\n\n".join(lines)
 
 
+def post_thread(client, channel: str, thread_ts: str, text: str):
+    # ✅ 항상 스레드에만 답글
+    client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
+
+
 def run_scan_and_reply(client, channel: str, thread_ts: str, product_url: str):
-    """
-    백그라운드 스레드에서 스캔 실행 → 스레드에 결과 업로드
-    """
     try:
-        client.chat_postMessage(
-            channel=channel,
-            thread_ts=thread_ts,
-            text=f"🔎 스캔 시작\n입력 URL: {product_url}\n(1초에 1회 요청 / 연속 100번 실패 시 중단, 조건부 추가 스캔 포함)",
+        platform, template_url = detect_platform_from_product_url(product_url)
+        if not platform:
+            post_thread(
+                client,
+                channel,
+                thread_ts,
+                f"❌ 처음 보는 페이지 패턴입니다.\n입력한 주소: {product_url}",
+            )
+            return
+
+        # ✅ 스캔 시작 전에 플랫폼/패턴 포함해서 안내
+        post_thread(
+            client,
+            channel,
+            thread_ts,
+            "🔎 스캔 시작\n"
+            f"- 감지 플랫폼: {platform}\n"
+            f"- 스캔 패턴: {template_url}\n"
+            f"- 속도: 1초 1회\n"
+            f"- 중단: 연속 100회 NOT FOUND/ERROR\n"
+            f"- 추가: 초반 0건이면 100회 1회 추가, "
+            f"또는 (발견 수 < 입력 제품ID*0.01)면 입력 제품ID부터 재스캔",
         )
 
         results = scan_for_slack(product_url)
 
-        client.chat_postMessage(
-            channel=channel,
-            thread_ts=thread_ts,
-            text="✅ 스캔 결과\n\n" + format_results(results),
+        post_thread(
+            client,
+            channel,
+            thread_ts,
+            "✅ 스캔 결과\n\n" + format_results(results),
         )
 
     except Exception as e:
-        client.chat_postMessage(
-            channel=channel,
-            thread_ts=thread_ts,
-            text=f"❌ 스캔 중 오류 발생\n{type(e).__name__}: {e}",
+        post_thread(
+            client,
+            channel,
+            thread_ts,
+            f"❌ 스캔 중 오류 발생\n{type(e).__name__}: {e}",
         )
 
 
 @app.event("message")
 def handle_message_events(body, event, client, logger):
-    # 봇 메시지/수정/알림 등 subtype 이벤트는 무시
     if event.get("subtype"):
         return
 
     channel = event.get("channel")
-
-    # 특정 채널만 감지하도록 제한
     if TARGET_CHANNEL_ID and channel != TARGET_CHANNEL_ID:
         return
 
     text = event.get("text", "")
-    ts = event.get("ts")  # 원문 메시지 ts를 thread_ts로 사용
+    ts = event.get("ts")  # 원문 메시지 ts = 스레드 루트
 
     url = extract_first_url(text)
     if not url:
         return
 
-    # 즉시 스레드에 "감지" 메시지 남기고, 스캔은 별도 스레드에서 실행
-    client.chat_postMessage(
-        channel=channel,
-        thread_ts=ts,
-        text=f"URL 감지 ✅\n{url}\n스캔을 시작합니다.",
-    )
+    # ✅ 채널에 새 메시지 만들지 않고 스레드에만
+    post_thread(client, channel, ts, f"URL을 감지했습니다. 확인해 보겠습니다!")
 
     t = threading.Thread(
         target=run_scan_and_reply,
