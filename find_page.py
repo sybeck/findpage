@@ -186,8 +186,8 @@ def clean_text(text: str) -> str:
 
 def extract_product_name(html: str) -> str:
     patterns = [
-        r'<meta[^>]+property=["\']og:title["\'][^>]*content=["\']([^"\']+)["\']',
-        r'<meta[^>]+name=["\']twitter:title["\'][^>]*content=["\']([^"\']+)["\']',
+        #r'<meta[^>]+property=["\']og:title["\'][^>]*content=["\']([^"\']+)["\']',
+        #r'<meta[^>]+name=["\']twitter:title["\'][^>]*content=["\']([^"\']+)["\']',
         r"<title[^>]*>(.*?)</title>",
     ]
     for pat in patterns:
@@ -271,12 +271,14 @@ def scan_pass(
                 consecutive_hits += 1
 
                 final_url = r.url
+                p_name = ""
                 if final_url not in found_urls:
                     name = extract_product_name(r.text or "")
                     found_products.append((name, final_url))
                     found_urls.add(final_url)
+                    p_name = name
 
-                print(f"  ✅ FOUND: {final_url} ({consecutive_hits}/{STOP_AFTER_CONSECUTIVE_HITS})")
+                print(f"  ✅ FOUND: {p_name}\n{final_url} ({consecutive_hits}/{STOP_AFTER_CONSECUTIVE_HITS})")
 
                 # ✅ 비정상 감지: 연속으로 너무 많이 FOUND
                 if consecutive_hits >= STOP_AFTER_CONSECUTIVE_HITS:
