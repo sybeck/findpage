@@ -14,10 +14,10 @@ NOT_FOUND_KEYWORDS = [
 ]
 
 SLEEP_SEC = 1.0
-STOP_AFTER_CONSECUTIVE_MISSES = 100
+STOP_AFTER_CONSECUTIVE_MISSES = 100   # ✅ 연속 실패 중단 기준
 TIMEOUT_SEC = 10
 
-USER_AGENT = "Mozilla/5.0 (compatible; ProductPageScanner/1.7)"
+USER_AGENT = "Mozilla/5.0 (compatible; ProductPageScanner/1.8)"
 
 # ----------------------------
 # URL utils
@@ -43,14 +43,14 @@ def is_homepage(url: str) -> bool:
     return (p.path or "").rstrip("/") in ["", "/"]
 
 # ----------------------------
-# Platform detection (감지용 패턴 확장)
+# Platform detection
 # ----------------------------
 def detect_platform_from_product_url(product_url: str):
     """
     감지용 패턴:
     - Cafe24:
         1) /surl/p/{id}
-        2) /product/.../{id}/category/...
+        2) /product/.../{id}/category/...   (감지 전용)
        → 감지 후 스캔은 항상 /surl/p/{id}
     - Imweb:
         /Product/?idx={id}
@@ -65,15 +65,15 @@ def detect_platform_from_product_url(product_url: str):
     query = parsed_raw.query or ""
     base = normalize_home(clean)
 
-    # ---- Cafe24 (A): /surl/p/{id}
+    # Cafe24 (A): /surl/p/{id}
     if "/surl/p/" in path and re.search(r"/surl/p/\d+", path):
         return "cafe24", f"{base}/surl/p/{{id}}"
 
-    # ---- Cafe24 (B): /product/.../{id}/category/...
+    # Cafe24 (B): /product/.../{id}/category/...  (감지 전용)
     if path.startswith("/product/") and re.search(r"/product/.+/\d+/category/", path):
         return "cafe24", f"{base}/surl/p/{{id}}"
 
-    # ---- Imweb: /Product/?idx={id}
+    # Imweb: /Product/?idx={id}
     if path.rstrip("/").lower().endswith("/product"):
         if re.search(r"(?:^|&)idx=\d+(?:&|$)", query, re.IGNORECASE):
             return "imweb", f"{base}/Product/?idx={{id}}"
@@ -105,6 +105,7 @@ def looks_not_found(status_code: int, requested_url: str, final_url: str, html: 
     if status_code != 200:
         return True
 
+    # 없는 상품이면 홈으로 리다이렉트되는 케이스
     if requested_url.rstrip("/") != final_url.rstrip("/") and is_homepage(final_url):
         return True
 
@@ -121,7 +122,17 @@ def looks_not_found(status_code: int, requested_url: str, final_url: str, html: 
 # ----------------------------
 # Scanner
 # ----------------------------
-def scan(template_url: str):
+def scan(
+    template_url: str,
+    stop_after_consecutive_misses: int = STOP_AFTER_CONSECUTIVE_MISSES,
+    sleep_sec: float = SLEEP_SEC,
+):
+    """
+    - 1초에 1번 스캔
+    - 연속 stop_after_consecutive_misses 번 NOT FOUND/ERROR면 중단
+    - 단, '아직 제품을 1개도 못 찾은 상태'에서 첫 중단 조건이 발생하면
+      같은 횟수만큼(=stop_after_consecutive_misses) 한 번 더 추가 시도
+    """
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
 
@@ -141,7 +152,7 @@ def scan(template_url: str):
 
             if looks_not_found(r.status_code, url, r.url, r.text or ""):
                 consecutive_misses += 1
-                print(f"  -> NOT FOUND ({consecutive_misses})")
+                print(f"  -> NOT FOUND ({consecutive_misses}/{stop_after_consecutive_misses})")
             else:
                 consecutive_misses = 0
                 final_url = r.url
@@ -155,19 +166,19 @@ def scan(template_url: str):
 
         except requests.RequestException as e:
             consecutive_misses += 1
-            print(f"  -> ERROR: {e} ({consecutive_misses})")
+            print(f"  -> ERROR: {e} ({consecutive_misses}/{stop_after_consecutive_misses})")
 
-        # 종료 조건 (초반 30번 전부 실패 시 1회 추가 허용)
-        if consecutive_misses >= STOP_AFTER_CONSECUTIVE_MISSES:
+        # ✅ 종료 조건
+        if consecutive_misses >= stop_after_consecutive_misses:
             if not found_products and not extra_retry_used:
-                print("\n[INFO] 아직 제품을 찾지 못해 추가 30회 스캔을 진행합니다.\n")
+                print(f"\n[INFO] 아직 제품을 하나도 찾지 못해 추가 {stop_after_consecutive_misses}회 스캔을 진행합니다.\n")
                 consecutive_misses = 0
                 extra_retry_used = True
             else:
                 break
 
         product_id += 1
-        time.sleep(SLEEP_SEC)
+        time.sleep(sleep_sec)
 
     return found_products
 
@@ -177,7 +188,7 @@ def scan(template_url: str):
 def main():
     print("제품 페이지 URL을 입력하세요 (UTM 포함 가능)")
     print("예) https://brainology.kr/surl/p/10")
-    print("예) https://brainology.kr/product/.../10/category/24/display/1/")
+    print("예) https://brainology.kr/product/.../10/category/24/display/1/  (감지 전용, 스캔은 /surl/p/{id})")
     print("예) https://www.realcumin.kr/Product/?idx=72")
     product_url = input("> ").strip()
 
@@ -190,9 +201,12 @@ def main():
 
     print(f"\n[INFO] 플랫폼: {platform}")
     print(f"[INFO] 실제 스캔 URL 패턴: {template_url}")
+    print(f"[INFO] 중단 기준: 연속 {STOP_AFTER_CONSECUTIVE_MISSES}회 NOT FOUND/ERROR")
+    print(f"[INFO] 초반 0건이면 동일 기준으로 1회 추가 시도")
     print("\n[START]\n")
 
-    results = scan(template_url)
+    # ✅ 여기서도 명시적으로 100 전달 (환경/호출 꼬임 방지)
+    results = scan(template_url, stop_after_consecutive_misses=STOP_AFTER_CONSECUTIVE_MISSES)
 
     print("\n" + "=" * 50)
     print("📦 스캔 결과 요약 (제품명 + URL)")
