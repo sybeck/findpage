@@ -30,10 +30,15 @@ def extract_first_url(text: str) -> str | None:
     return m.group(0) if m else None
 
 
-def format_results(results: list[tuple[str, str]]) -> str:
+def format_results(results: list[tuple[str, str]], new_count: int = 0) -> str:
     if not results:
         return "찾은 제품 페이지가 없습니다."
     lines = []
+    total = len(results)
+    existing = total - new_count
+    
+    lines.append(f"📊 전체 제품 수: {total}개 (기존: {existing}개, 신규: {new_count}개)\n")
+    
     for i, (name, url) in enumerate(results, 1):
         lines.append(f"{i}. {name}\n{url}")
     return "\n\n".join(lines)
@@ -42,6 +47,25 @@ def format_results(results: list[tuple[str, str]]) -> str:
 def post_thread(client, channel: str, thread_ts: str, text: str):
     # ✅ 항상 스레드에만 답글
     client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
+
+
+def upload_file_to_thread(client, channel: str, thread_ts: str, file_path: str, title: str):
+    """
+    파일을 스레드에 업로드
+    """
+    try:
+        with open(file_path, 'rb') as file_content:
+            client.files_upload_v2(
+                channel=channel,
+                thread_ts=thread_ts,
+                file=file_content,
+                title=title,
+                filename=os.path.basename(file_path)
+            )
+        print(f"[INFO] 파일 업로드 완료: {file_path}")
+    except Exception as e:
+        print(f"[ERROR] 파일 업로드 실패: {e}")
+        post_thread(client, channel, thread_ts, f"❌ 파일 업로드 실패: {e}")
 
 
 def run_scan_and_reply(client, channel: str, thread_ts: str, product_url: str):
@@ -70,14 +94,26 @@ def run_scan_and_reply(client, channel: str, thread_ts: str, product_url: str):
             f"또는 (발견 수 < 입력 제품ID*0.01)면 입력 제품ID부터 재스캔",
         )
 
-        results = scan_for_slack(product_url)
+        # scan_for_slack는 이제 (전체 제품, 신규 제품, 인플루언서 파일명) 반환
+        all_products, new_products, influencer_file = scan_for_slack(product_url)
 
+        # 결과 메시지 (전체 제품 + 신규 개수 표시)
         post_thread(
             client,
             channel,
             thread_ts,
-            "✅ 스캔 결과\n\n" + format_results(results),
+            "✅ 스캔 결과\n\n" + format_results(all_products, len(new_products)),
         )
+
+        # 인플루언서 파일이 생성되었으면 업로드
+        if influencer_file and os.path.exists(influencer_file):
+            upload_file_to_thread(
+                client,
+                channel,
+                thread_ts,
+                influencer_file,
+                "인플루언서명 추출 결과"
+            )
 
     except Exception as e:
         post_thread(

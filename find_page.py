@@ -1,5 +1,6 @@
 import time
 import re
+import os
 from urllib.parse import urlparse, urlunparse, parse_qs
 
 import requests
@@ -35,6 +36,14 @@ def normalize_home(url: str) -> str:
     u = ensure_scheme(url)
     p = urlparse(u)
     return urlunparse((p.scheme, p.netloc, "", "", "", ""))
+
+def get_domain_from_url(url: str) -> str:
+    """
+    URL에서 도메인명을 추출 (예: 'brainology.kr')
+    """
+    u = ensure_scheme(url)
+    p = urlparse(u)
+    return p.netloc.replace('www.', '')
 
 def strip_query_fragment(url: str) -> str:
     """
@@ -196,6 +205,24 @@ def extract_product_name(html: str) -> str:
             return clean_text(m.group(1))
     return "(제품명 추출 실패)"
 
+def extract_influencer_names(product_names: list[str]) -> list[str]:
+    """
+    제품명 리스트에서 "네", "맘", "약"이 포함된 단어를 추출.
+    예: "서울네약국 프리미엄" -> ["서울네약국"]
+    """
+    influencers = set()
+    target_chars = ['네', '맘', '약']
+    
+    for name in product_names:
+        # 공백과 특수문자로 단어 분리
+        words = re.findall(r'[가-힣a-zA-Z0-9]+', name)
+        for word in words:
+            # 단어에 "네", "맘", "약" 중 하나라도 포함되면 추가
+            if any(char in word for char in target_chars):
+                influencers.add(word)
+    
+    return sorted(list(influencers))
+
 # ----------------------------
 # Not-found 판단 (✅ 원래 아이디어대로: 홈/인덱스 리다이렉트는 NOT FOUND)
 # ----------------------------
@@ -218,6 +245,98 @@ def looks_not_found(status_code: int, requested_url: str, final_url: str, html: 
         return True
 
     return False
+
+# ----------------------------
+# File I/O for domain-based tracking
+# ----------------------------
+def get_last_id_from_file(domain: str) -> int:
+    """
+    도메인명.txt 파일에서 마지막 ID를 읽어옴.
+    파일이 없거나 읽기 실패시 0을 반환.
+    """
+    filename = f"{domain}.txt"
+    if not os.path.exists(filename):
+        return 0
+    
+    try:
+        with open(filename, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+            if not lines:
+                return 0
+            # 마지막 라인에서 ID 추출 (형식: "번호. 제품명\nURL")
+            for line in reversed(lines):
+                line = line.strip()
+                if line.startswith('http'):
+                    # URL에서 ID 추출
+                    match = re.search(r'/(\d+)(?:[/?#]|$)', line)
+                    if match:
+                        return int(match.group(1))
+            return 0
+    except Exception as e:
+        print(f"[WARNING] {domain}.txt 파일 읽기 실패: {e}")
+        return 0
+
+def load_existing_products(domain: str) -> list[tuple[str, str]]:
+    """
+    도메인명.txt 파일에서 기존 제품 목록을 로드.
+    """
+    filename = f"{domain}.txt"
+    if not os.path.exists(filename):
+        return []
+    
+    products = []
+    try:
+        with open(filename, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+            i = 0
+            while i < len(lines):
+                line = lines[i].strip()
+                # "번호. 제품명" 형식 찾기
+                if re.match(r'^\d+\.\s+', line):
+                    name = re.sub(r'^\d+\.\s+', '', line)
+                    # 다음 줄이 URL인지 확인
+                    if i + 1 < len(lines):
+                        url_line = lines[i + 1].strip()
+                        if url_line.startswith('http'):
+                            products.append((name, url_line))
+                            i += 2
+                            continue
+                i += 1
+    except Exception as e:
+        print(f"[WARNING] {domain}.txt 파일 로드 실패: {e}")
+    
+    return products
+
+def save_products_to_file(domain: str, products: list[tuple[str, str]]):
+    """
+    제품 목록을 도메인명.txt 파일로 저장.
+    """
+    filename = f"{domain}.txt"
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            for idx, (name, url) in enumerate(products, 1):
+                f.write(f"{idx}. {name}\n")
+                f.write(f"{url}\n\n")
+        print(f"[INFO] {len(products)}개 제품을 {filename}에 저장했습니다.")
+    except Exception as e:
+        print(f"[ERROR] {filename} 저장 실패: {e}")
+
+def save_influencers_to_file(domain: str, influencers: list[str]) -> str:
+    """
+    인플루언서명을 도메인_influencers.txt 파일로 저장하고 파일명 반환.
+    """
+    filename = f"{domain}_influencers.txt"
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write("# 인플루언서명 추출 결과\n")
+            f.write("# '네', '맘', '약'이 포함된 단어들\n\n")
+            for inf in influencers:
+                f.write(f"{inf}\n")
+        print(f"[INFO] {len(influencers)}개 인플루언서명을 {filename}에 저장했습니다.")
+        return filename
+    except Exception as e:
+        print(f"[ERROR] {filename} 저장 실패: {e}")
+        return ""
 
 # ----------------------------
 # Scanner (1-pass)
@@ -387,6 +506,9 @@ def main():
 def scan_for_slack(product_url: str):
     """
     Slack bot용 엔트리 함수
+    - 도메인별 .txt 파일에서 마지막 ID 확인
+    - 스캔 후 결과를 .txt 파일에 저장
+    - 기존 + 신규 제품 모두 반환
     """
     platform, template_url = detect_platform_from_product_url(product_url)
     if not platform:
@@ -396,17 +518,35 @@ def scan_for_slack(product_url: str):
     if input_product_id is None:
         raise ValueError("Failed to extract product id from URL")
 
+    # 도메인 추출
+    domain = get_domain_from_url(product_url)
+    
+    # 기존 제품 로드
+    existing_products = load_existing_products(domain)
+    existing_urls = {url for _, url in existing_products}
+    
+    # 마지막 ID 확인
+    last_id = get_last_id_from_file(domain)
+    start_id = last_id + 1 if last_id > 0 else 1
+    
+    print(f"[INFO] 도메인: {domain}")
+    print(f"[INFO] 기존 제품 수: {len(existing_products)}")
+    print(f"[INFO] 마지막 ID: {last_id}")
+    print(f"[INFO] 스캔 시작 ID: {start_id}")
+
+    # 스캔 시작
     found_products, found_urls = scan_pass(
         template_url=template_url,
-        start_id=1,
+        start_id=start_id,
         stop_after_consecutive_misses=STOP_AFTER_CONSECUTIVE_MISSES,
         sleep_sec=SLEEP_SEC,
         allow_extra_retry_if_zero_found=True,
         found_products=[],
-        found_urls=set(),
+        found_urls=existing_urls.copy(),
     )
 
-    if len(found_products) < (input_product_id * 0.01):
+    # 2차 스캔 조건 확인 (입력 ID가 start_id보다 크고, 발견 수가 적을 때)
+    if input_product_id > start_id and len(found_products) < (input_product_id * 0.01):
         found_products, found_urls = scan_pass(
             template_url=template_url,
             start_id=input_product_id,
@@ -417,7 +557,25 @@ def scan_for_slack(product_url: str):
             found_urls=found_urls,
         )
 
-    return found_products
+    # 기존 + 신규 제품 합치기
+    all_products = existing_products + found_products
+    
+    # 파일에 저장 (전체 제품)
+    save_products_to_file(domain, all_products)
+    
+    # 인플루언서명 추출
+    all_product_names = [name for name, _ in all_products]
+    influencers = extract_influencer_names(all_product_names)
+    
+    # 인플루언서명 파일 저장
+    influencer_file = save_influencers_to_file(domain, influencers)
+    
+    # 신규 제품 수 출력
+    print(f"[INFO] 신규 발견 제품: {len(found_products)}개")
+    print(f"[INFO] 전체 제품: {len(all_products)}개")
+    print(f"[INFO] 인플루언서명: {len(influencers)}개")
+
+    return all_products, found_products, influencer_file
 
 if __name__ == "__main__":
     main()
