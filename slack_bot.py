@@ -51,9 +51,10 @@ def post_thread(client, channel: str, thread_ts: str, text: str):
 
 def upload_file_to_thread(client, channel: str, thread_ts: str, file_path: str, title: str):
     """
-    파일을 스레드에 업로드
+    파일을 스레드에 업로드 (실패 시 텍스트로 전달)
     """
     try:
+        # 먼저 파일 업로드 시도
         with open(file_path, 'rb') as file_content:
             client.files_upload_v2(
                 channel=channel,
@@ -65,7 +66,23 @@ def upload_file_to_thread(client, channel: str, thread_ts: str, file_path: str, 
         print(f"[INFO] 파일 업로드 완료: {file_path}")
     except Exception as e:
         print(f"[ERROR] 파일 업로드 실패: {e}")
-        post_thread(client, channel, thread_ts, f"❌ 파일 업로드 실패: {e}")
+        # 파일 업로드 실패 시 내용을 텍스트로 전달
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            # 메시지 길이 제한 (3000자)
+            if len(content) > 3000:
+                content = content[:3000] + "\n...(생략)"
+            post_thread(
+                client,
+                channel,
+                thread_ts,
+                f"📄 **{title}**\n```\n{content}\n```"
+            )
+            print(f"[INFO] 파일 내용을 텍스트로 전달: {file_path}")
+        except Exception as text_error:
+            print(f"[ERROR] 텍스트 전달도 실패: {text_error}")
+            post_thread(client, channel, thread_ts, f"❌ 파일 전달 실패: {e}")
 
 
 def run_scan_and_reply(client, channel: str, thread_ts: str, product_url: str):
