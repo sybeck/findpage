@@ -2,6 +2,7 @@
 import os
 import re
 import threading
+from pathlib import Path
 
 from dotenv import load_dotenv
 from slack_bolt import App
@@ -9,7 +10,7 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 from find_page import scan_for_slack, detect_platform_from_product_url
 
-load_dotenv()
+load_dotenv(Path(__file__).with_name(".env"))
 
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 SLACK_APP_TOKEN = os.getenv("SLACK_APP_TOKEN")
